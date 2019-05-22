@@ -38,14 +38,12 @@ def get_bool_array_fp(drive_out_dir, lat_or_lon, index):
     # example: lat_0.npy -> bool of first row in bbox
     return os.path.join(drive_out_dir, "%s_%d.npy" % (lat_or_lon, index))
     
-def get_drive_tile_dir_path(drive_out_dir, quadkey):
-    return os.path.join(drive_out_dir, quadkey)
 
 def get_drive_tile_fuse_fp(drive_out_dir, quadkey, fmt):
-    return os.path.join(get_drive_tile_dir_path(drive_out_dir, quadkey), '%s.%s' % (quadkey, fmt))
+    return os.path.join(drive_out_dir, '%s.%s' % (quadkey, fmt))
     
-def get_drive_tile_meta_fp(drive_out_dir, quadkey):
-    return os.path.join(get_drive_tile_dir_path(drive_out_dir, quadkey), '%s.meta' % quadkey)
+def get_drive_meta_fp(drive_out_dir):
+    return os.path.join(drive_out_dir, 'meta.txt')
 
 def save_mask(fp, arr):
     compact = np.packbits(arr)
@@ -124,7 +122,7 @@ def generate_edges(quadkeys, buf_size, use_buf):
     return bboxes, begin_edges_lat, end_edges_lat, begin_edges_lon, end_edges_lon
 
 
-def run(drive_fp, drive_out_dir, lat1, lat2, lon1, lon2, sample_rate, level_of_detail=22, buf_size=0.2, use_buf=False, verbose=True, fmt='npy', remove_dump=False, drive_counter=0):
+def run(drive_fp, drive_out_dir, lat1, lat2, lon1, lon2, use_bbox, sample_rate, level_of_detail=22, buf_size=0.2, use_buf=False, verbose=True, fmt='npy', remove_dump=False, drive_counter=0):
 
     dump_dir = get_drive_bool_dump_dir_path(drive_out_dir)
     if not os.path.exists(drive_out_dir):
@@ -135,6 +133,7 @@ def run(drive_fp, drive_out_dir, lat1, lat2, lon1, lon2, sample_rate, level_of_d
     drive_id = get_drive_id(drive_fp)
     if verbose: print("drive %s: loading points" % (drive_id))
     points = load_points(drive_fp)
+    raw_num_points = points.shape[0]
     if verbose: print("drive %s: finished loading points, total %d points" % (drive_id, points.shape[0]))
     
     sample_rate = int(sample_rate)
@@ -144,16 +143,16 @@ def run(drive_fp, drive_out_dir, lat1, lat2, lon1, lon2, sample_rate, level_of_d
     
     # resize bbox
     min_lat, min_lon, _ = np.min(points, axis=0)
-    min_lat = max(min_lat, lat2)
-    min_lon = max(min_lon, lon1)
     max_lat, max_lon, _ = np.max(points, axis=0)
-    max_lat = min(max_lat, lat1)
-    max_lon = min(max_lon, lon2)
+    if use_bbox:
+        min_lat = max(min_lat, lat2)
+        min_lon = max(min_lon, lon1)
+        max_lat = min(max_lat, lat1)
+        max_lon = min(max_lon, lon2)
     if verbose: print("drive %s: resized bbox: (%f, %f), (%f, %f)" % (drive_id, max_lat, min_lon, min_lat, max_lon))
     quadkeys, _, _ = TileSystem.boundingBoxToTileQuadKeys2(max_lat, min_lon,min_lat, max_lon, level_of_detail)
     
     # generate edges
-    
     _, begin_edges_lat, end_edges_lat, begin_edges_lon, end_edges_lon = generate_edges(quadkeys, buf_size=buf_size, use_buf=use_buf)
     if verbose: print("drive %s: finished generating tile edges. %d x %d tiles." % (drive_id, len(quadkeys), len(quadkeys[0])))
     
@@ -187,6 +186,7 @@ def run(drive_fp, drive_out_dir, lat1, lat2, lon1, lon2, sample_rate, level_of_d
     
     used_points = 0
     num_tiles = len(quadkeys) * len(quadkeys[0])
+    valid_tiles = [ ]
     if verbose: print("drive %s: begin saving fuses, total %d tiles" % (drive_id, num_tiles))
     for r in range(len(quadkeys)):
         for c in range(len(quadkeys[r])):
@@ -196,13 +196,11 @@ def run(drive_fp, drive_out_dir, lat1, lat2, lon1, lon2, sample_rate, level_of_d
             final_bool = load_mask(get_bool_array_fp(dump_dir, "lat", r), points.shape[0]) & load_mask(get_bool_array_fp(dump_dir, "lon", c), points.shape[0])
             curr_used_points = np.sum(final_bool)
             if curr_used_points == 0:
+                num_tiles -= 1
                 continue
             
             # save fuse
             used_points += curr_used_points
-            tile_dir = get_drive_tile_dir_path(drive_out_dir, quadkeys[r][c])
-            if not os.path.exists(tile_dir):
-                os.mkdir(tile_dir)
             if fmt == 'npy':
                 np.save(get_drive_tile_fuse_fp(drive_out_dir, quadkeys[r][c], fmt), points[final_bool])
             else:
@@ -210,26 +208,34 @@ def run(drive_fp, drive_out_dir, lat1, lat2, lon1, lon2, sample_rate, level_of_d
                            newline='\n', fmt='%.8f,%.8f,%.3f')
             if verbose: print("drive %s: finishied saving fuse for tile %s" % (drive_id, quadkeys[r][c]))
             del final_bool
-            
-            # meta
-            with open(get_drive_tile_meta_fp(drive_out_dir, quadkeys[r][c]), 'w') as f:
-                f.write('#drive-id:%s\n' % drive_id)
-                f.write('#quadkey:%s\n' % quadkeys[r][c])
-                f.write('#level-of-detail:%d\n' % level_of_detail)
-                f.write('#global-bbox:(%f,%f),(%f,%f)\n' % (lat1, lon1, lat2, lon2))
-                f.write('#used-bbox:(%f,%f),(%f,%f)\n' % (max_lat, min_lon, min_lat, max_lon))
-                f.write('#buffer-on:{}\n'.format(use_buf))
-                if use_buf: f.write('#buffer-size:%f\n' % (buf_size))
-            
+        
             num_tiles -= 1
+            valid_tiles.append(quadkeys[r][c])
             if verbose: print("drive %s: %d tiles remaining" % (drive_id, num_tiles))
             
             
-    if verbose: print("drive %s: used points %d, total points %d" % (drive_id, used_points, points.shape[0]))
+    if verbose: print("drive %s: used points %d, total points %d; valid tiles %d" % (drive_id, used_points, points.shape[0], len(valid_tiles)))
     assert(used_points == points.shape[0])
+    
+    # drive meta
+    with open(get_drive_meta_fp(drive_out_dir), 'w') as f:
+        f.write('#drive-id:%s\n' % drive_id)
+        f.write('#num-points:%d\n' % raw_num_points)
+        f.write('#sample-rate:%d\n' % sample_rate)
+        f.write('#num-points-after-downsampling:%d\n' % points.shape[0])
+        f.write('#level-of-detail:%d\n' % level_of_detail)
+        f.write('#global-bbox:(%f,%f),(%f,%f)\n' % (lat1, lon1, lat2, lon2))
+        f.write('#drive-bbox:(%f,%f),(%f,%f)\n' % (max_lat, min_lon, min_lat, max_lon))
+        f.write('#use-global-bbox:{}\n'.format(use_bbox))
+        f.write('#buffer-on:{}\n'.format(use_buf))
+        if use_buf: f.write('#buffer-size:%f\n' % (buf_size))
+        f.write('#num-tiles:%d\n' % len(valid_tiles))
+        for q in valid_tiles:
+            f.write('#valid-tile-quadkey:%s\n' % q)
     
     if remove_dump:
         shutil.rmtree(dump_dir)
+        if verbose: print("drive %s: finished removing dump." % drive_id)
     
     print("finished drive #%d" % drive_counter)
             
@@ -246,6 +252,7 @@ if __name__ == "__main__":
     lon2 = float(sys.argv[9])
     level_of_detail = int(sys.argv[10])
     # other params
+    use_bbox = False
     buf_size = 0.15 # not used
     use_buf = False
     verbose = False
@@ -269,8 +276,7 @@ if __name__ == "__main__":
     start_time = time.time()
     
     drives = glob.glob(os.path.join(src_dir, "*", "debug", "*", "*", "*.laz")) # PART A, B
-    drives.extend(glob.glob(os.path.join(target_dir, "*", "*", "*", "*.laz"))) # PART C, D
-    drives = drives[:4]
+    drives.extend(glob.glob(os.path.join(src_dir, "*", "*", "*", "*.laz"))) # PART C, D
     print("found %d drives" % len(drives))
     
     p = Pool(processes=num_processes)
@@ -279,7 +285,7 @@ if __name__ == "__main__":
     for drive in drives:
         drive_out_dir = get_drive_dir_path(target_dir, get_drive_id(drive))
         p.apply_async(run,
-                      args=[drive, drive_out_dir, lat1, lat2, lon1, lon2, 
+                      args=[drive, drive_out_dir, lat1, lat2, lon1, lon2, use_bbox,
                             sample_rate, level_of_detail, buf_size, use_buf, verbose, fmt, remove_dump, drive_counter]
                       )
         drive_counter += 1
